@@ -1,64 +1,129 @@
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+import os
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from accelerate import Accelerator
+from diffusers import DDPMScheduler, UNet2DConditionModel
+from transformers import CLIPTextModel, CLIPTokenizer
+from PIL import Image
+import torchvision.transforms as transforms
+from tqdm import tqdm
 
-def train():
-    
+# 1. Dataset Class
+class TextImageDataset(Dataset):
+    def __init__(self, root_dir=".train", size=512):
+        self.root_dir = root_dir
+        self.image_files = [f for f in os.listdir(root_dir) if f.endswith((".png", ".jpg", ".jpeg"))]
+        self.transform = transforms.Compose([
+            transforms.Resize(size),
+            transforms.CenterCrop(size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ])
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_name = self.image_files[idx]
+        img_path = os.path.join(self.root_dir, img_name)
+        
+        # Get corresponding prompt file
+        base_name = os.path.splitext(img_name)[0]
+        txt_path = os.path.join(self.root_dir, f"{base_name}_prompt.txt")
+        
+        if not os.path.exists(txt_path):
+            txt_path = os.path.join(self.root_dir, f"{base_name}.txt")
+        
+        image = Image.open(img_path).convert("RGB")
+        image = self.transform(image)
+        
+        with open(txt_path, "r", encoding="utf-8") as f:
+            prompt = f.read().strip()
+        
+        return {"pixel_values": image, "text": prompt}
+
+# 2. Training Setup
+def main():
+    # Initialize Accelerator
     accelerator = Accelerator(
-        mixed_precision="bf16",
-        fsdp_plugin=FSDPPlugin(
-            sharding_strategy="FULL_SHARD",
-            auto_wrap_policy=size_based_auto_wrap_policy(min_num_params=1e8),
-            cpu_offload=True,
-        )
+        mixed_precision="fp16",
+        gradient_accumulation_steps=2,
+        log_with="tensorboard",
+        project_dir="logs"
     )
     
-    
-    text_encoder = MegaTextEncoder()
-    unet = UltraUNet3D()
-    
-  
-    optimizer = bitsandbytes.Adam8bit(
-        list(unet.parameters()) + list(text_encoder.parameters()),
-        lr=1e-5,
-        betas=(0.9, 0.98),
-        weight_decay=0.01,
+    # Models
+    tokenizer = CLIPTokenizer.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="text_encoder")
+    unet = UNet2DConditionModel.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="unet")
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=1000,
+        beta_start=0.0001,
+        beta_end=0.02,
+        beta_schedule="linear"
     )
     
+    # Dataset and DataLoader
+    dataset = TextImageDataset(root_dir=".train")
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
     
-    unet = accelerator.prepare_model(unet)
-    text_encoder = accelerator.prepare_model(text_encoder)
-    optimizer = accelerator.prepare_optimizer(optimizer)
+    # Optimizer
+    optimizer = AdamW(unet.parameters(), lr=1e-5)
     
-    # Gradient checkpointing
-    unet.enable_gradient_checkpointing()
-    text_encoder.gradient_checkpointing_enable()
+    # Prepare with Accelerator
+    unet, text_encoder, optimizer, dataloader = accelerator.prepare(
+        unet, text_encoder, optimizer, dataloader
+    )
     
-    # DataLoader
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
-    dataloader = accelerator.prepare(dataloader)
-    
-    
-    for epoch in range(100):
-        for batch in dataloader:
+    # Training Loop
+    num_epochs = 100
+    for epoch in range(num_epochs):
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
+        for batch in progress_bar:
             with accelerator.accumulate(unet):
-                # Forward pass
-                images = batch["images"].to(accelerator.device)
-                text = batch["text"]
+                # Convert images to latent space
+                latents = torch.randn_like(batch["pixel_values"])  # Simplified for example
                 
+                # Tokenize text
+                inputs = tokenizer(
+                    batch["text"],
+                    padding="max_length",
+                    max_length=tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt"
+                ).to(accelerator.device)
                 
-                input_ids = tokenizer(text, return_tensors="pt").input_ids.to(accelerator.device)
-                text_emb = text_encoder(input_ids)
+                # Get text embeddings
+                text_embeddings = text_encoder(inputs.input_ids)[0]
                 
+                # Sample noise
+                noise = torch.randn_like(latents)
+                timesteps = torch.randint(
+                    0, noise_scheduler.num_train_timesteps,
+                    (latents.shape[0],),
+                    device=accelerator.device
+                ).long()
                 
-                noise = torch.randn_like(images)
-                timesteps = torch.randint(0, 1000, (images.shape[0],)).to(accelerator.device)
-                noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
+                # Add noise
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
+                # Predict noise
+                noise_pred = unet(noisy_latents, timesteps, text_embeddings).sample
                 
-                pred_noise = unet(noisy_images, timesteps, text_emb)
+                # Calculate loss
+                loss = F.mse_loss(noise_pred, noise)
                 
-                
-                loss = F.mse_loss(pred_noise, noise)
+                # Backpropagate
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
+                
+                progress_bar.set_postfix({"loss": loss.item()})
+        
+        # Save checkpoint
+        if epoch % 5 == 0:
+            accelerator.save_state(output_dir=f"checkpoints/epoch_{epoch}")
+
+if __name__ == "__main__":
+    main()
